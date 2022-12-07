@@ -1,4 +1,24 @@
 import jax
+from jax_smi import initialise_tracking
+initialise_tracking()
+
+# something wrong is happening as for a single core all the memory is getting hogged
+# try alternative ways of using pmap
+# ref: https://colab.research.google.com/drive/1hXns2b6T8T393zSrKCSoUktye1YlSe8U
+# device: Total 20.5GB
+#           15.2GB (74.28%): TPU_0(process=0,(0,0,0,0))
+#          771.9MB ( 3.67%): TPU_1(process=0,(0,0,0,1))
+#          771.9MB ( 3.67%): TPU_2(process=0,(1,0,0,0))
+#          771.9MB ( 3.67%): TPU_3(process=0,(1,0,0,1))
+#          771.9MB ( 3.67%): TPU_4(process=0,(0,1,0,0))
+#          771.9MB ( 3.67%): TPU_5(process=0,(0,1,0,1))
+#          771.9MB ( 3.67%): TPU_6(process=0,(1,1,0,0))
+#          771.9MB ( 3.67%): TPU_7(process=0,(1,1,0,1))
+
+#  kind: Total 20.5GB
+#           20.5GB (  100%): buffer
+#        -625.0B (2.8e-06%): executable
+
 import jax.numpy as jnp
 
 print(jax.devices())
@@ -31,7 +51,7 @@ max_length = 8
 # let's use a smaller image size (height, width) because otherwise OOM
 # the higher the resolution, the better the results will be
 # so if you have a big GPU, feel free to increase
-image_size = [512, 512]
+image_size = [400, 400]
 height, width = image_size
 num_channels = 3
 
@@ -240,7 +260,7 @@ train_dataset = DonutDataset("nielsr/rvl_cdip_10_examples_per_class_donut", max_
                              )
 
 # I'm using a small batch size to make sure it fits in the memory Colab provides
-train_dataloader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True)
 
 
 validation_dataset = DonutDataset("nielsr/rvl_cdip_10_examples_per_class_donut", max_length=max_length,
@@ -321,18 +341,20 @@ def shift_tokens_right(input_ids: np.ndarray, pad_token_id: int, decoder_start_t
     return jnp.asarray(shifted_input_ids, dtype=jnp.int32)
 
 
-@partial(jax.pmap, axis_name="device", out_axes=(None, 0, 0, 0))
-def train_step(
-    state: TrainState, batch
-):
+def train_step(state: TrainState, batch):
+    device_count = jax.local_device_count()
 
     images, labels = jnp.asarray(batch["pixel_values"].numpy()), batch["labels"].numpy()
     images = images.transpose(0, 2, 3, 1)
     decoder_input_ids = shift_tokens_right(labels, model.config.pad_token_id, model.config.decoder_start_token_id)
     labels = jnp.asarray(labels)
     position_ids = jnp.broadcast_to(jnp.arange(0, labels.shape[1]), labels.shape)
+    images = jnp.reshape(images, (device_count, -1, *images.shape[1:]))
+    decoder_input_ids = jnp.reshape(decoder_input_ids, (device_count, -1, *decoder_input_ids.shape[1:]))
+    labels = jnp.reshape(labels, (device_count, -1, *labels.shape[1:]))
+    position_ids = jnp.reshape(position_ids, (device_count, -1, *position_ids.shape[1:]))
 
-    def loss_fn(params):
+    def loss_fn(params, images, decoder_input_ids, position_ids, labels):
         lm_outputs = state.apply_fn({'params': params}, images, decoder_input_ids, None, position_ids)
         loss = optax.softmax_cross_entropy_with_integer_labels(logits=lm_outputs.logits, labels=labels).mean()
         return loss, lm_outputs.logits
@@ -340,7 +362,10 @@ def train_step(
     # hack #2 I am using allow_int to handle this model param, which is not be finetuned
     # https://github.com/amankhandelia/transformers/blob/feature/donut_flax_implementation/src/transformers/models/donut/modeling_flax_donut_swin.py#L411
     gradient_fn = jax.value_and_grad(loss_fn, has_aux=True, allow_int=True)
-    (loss, logits), grads = gradient_fn(state.params)
+
+    # Use pmap to parallelize the computation
+    pmap_fn = jax.pmap(gradient_fn, in_axes=(None, 0, 0, 0, 0))
+    (loss, logits), grads = pmap_fn(state.params, images, decoder_input_ids, position_ids, labels)
     state = state.apply_gradients(grads=grads)
     return loss, state
 
@@ -364,10 +389,10 @@ def get_args_for_models(batch: dict, model: FlaxVisionEncoderDecoderModel):
 
 def get_accuracy_score(model: FlaxVisionEncoderDecoderModel, state: TrainState, val_dataloader: DataLoader) -> int:
     results = []
-    pmap_apply = jax.pmap(model.module.apply)
+
     for i, batch in enumerate(tqdm(val_dataloader)):
         # get args for model
-        images, labels, decoder_input_ids, position_ids = get_args_for_models(batch)
+        images, labels, decoder_input_ids, position_ids = get_args_for_models(batch, model)
 
         # classify doc
         lm_outputs = model.module.apply({'params': state.params}, images, decoder_input_ids, None, position_ids)
@@ -383,7 +408,6 @@ def get_accuracy_score(model: FlaxVisionEncoderDecoderModel, state: TrainState, 
 from tqdm.auto import tqdm
 for epoch in range(10):
     print("Epoch:", epoch + 1)
-    score = get_accuracy_score(model, state, validation_dataloader)
     for i, batch in enumerate(tqdm(train_dataloader)):
         loss, state = train_step(state, batch)
     print(f"Loss: {loss}")
