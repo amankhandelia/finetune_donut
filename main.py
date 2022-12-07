@@ -51,7 +51,7 @@ max_length = 8
 # let's use a smaller image size (height, width) because otherwise OOM
 # the higher the resolution, the better the results will be
 # so if you have a big GPU, feel free to increase
-image_size = [400, 400]
+image_size = [512, 512]
 height, width = image_size
 num_channels = 3
 
@@ -260,7 +260,8 @@ train_dataset = DonutDataset("nielsr/rvl_cdip_10_examples_per_class_donut", max_
                              )
 
 # I'm using a small batch size to make sure it fits in the memory Colab provides
-train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+train_batch_size = 8
+train_dataloader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True)
 
 
 validation_dataset = DonutDataset("nielsr/rvl_cdip_10_examples_per_class_donut", max_length=max_length,
@@ -354,8 +355,10 @@ def train_step(state: TrainState, batch):
     labels = jnp.reshape(labels, (device_count, -1, *labels.shape[1:]))
     position_ids = jnp.reshape(position_ids, (device_count, -1, *position_ids.shape[1:]))
 
-    def loss_fn(params, images, decoder_input_ids, position_ids, labels):
-        lm_outputs = state.apply_fn({'params': params}, images, decoder_input_ids, None, position_ids)
+    def loss_fn(
+            state: TrainState, images: jnp.ndarray, decoder_input_ids: jnp.ndarray, position_ids: jnp.ndarray,
+            labels: jnp.ndarray):
+        lm_outputs = state.apply_fn({'params': state.params}, images, decoder_input_ids, None, position_ids)
         loss = optax.softmax_cross_entropy_with_integer_labels(logits=lm_outputs.logits, labels=labels).mean()
         return loss, lm_outputs.logits
 
@@ -365,7 +368,7 @@ def train_step(state: TrainState, batch):
 
     # Use pmap to parallelize the computation
     pmap_fn = jax.pmap(gradient_fn, in_axes=(None, 0, 0, 0, 0))
-    (loss, logits), grads = pmap_fn(state.params, images, decoder_input_ids, position_ids, labels)
+    (loss, logits), grads = pmap_fn(state, images, decoder_input_ids, position_ids, labels)
     state = state.apply_gradients(grads=grads)
     return loss, state
 
