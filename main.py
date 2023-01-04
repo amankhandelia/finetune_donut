@@ -1,36 +1,26 @@
-import jax
-from jax_smi import initialise_tracking
-initialise_tracking()
-
-# something wrong is happening as for a single core all the memory is getting hogged
-# try alternative ways of using pmap
-# ref: https://colab.research.google.com/drive/1hXns2b6T8T393zSrKCSoUktye1YlSe8U
-# device: Total 20.5GB
-#           15.2GB (74.28%): TPU_0(process=0,(0,0,0,0))
-#          771.9MB ( 3.67%): TPU_1(process=0,(0,0,0,1))
-#          771.9MB ( 3.67%): TPU_2(process=0,(1,0,0,0))
-#          771.9MB ( 3.67%): TPU_3(process=0,(1,0,0,1))
-#          771.9MB ( 3.67%): TPU_4(process=0,(0,1,0,0))
-#          771.9MB ( 3.67%): TPU_5(process=0,(0,1,0,1))
-#          771.9MB ( 3.67%): TPU_6(process=0,(1,1,0,0))
-#          771.9MB ( 3.67%): TPU_7(process=0,(1,1,0,1))
-
-#  kind: Total 20.5GB
-#           20.5GB (  100%): buffer
-#        -625.0B (2.8e-06%): executable
-
-import jax.numpy as jnp
-
-print(jax.devices())
-
-from datasets import load_dataset
-from torch.utils.data import DataLoader
+from functools import partial
 import json
 import random
-from typing import Any, List, Tuple
+from typing import Any, Dict, List, Tuple
+
+import jax
+import jax.numpy as jnp
+
+import optax
+from flax.training.train_state import TrainState
+import numpy as np
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
+from jax_smi import initialise_tracking
+from tqdm.auto import tqdm
+
+from datasets import load_dataset
+from PIL import Image
+from ast import literal_eval
+
+initialise_tracking()
+print(jax.devices())
 
 dataset = load_dataset("nielsr/rvl_cdip_10_examples_per_class_donut")
 
@@ -40,7 +30,6 @@ print(id2label)
 example = dataset["train"][0]
 example["ground_truth"]
 
-from ast import literal_eval
 
 literal_eval(example["ground_truth"])['gt_parse']
 
@@ -64,7 +53,8 @@ config.decoder.max_length = max_length
 # TODO we should actually update max_position_embeddings and interpolate the pre-trained ones:
 # https://github.com/clovaai/donut/blob/0acc65a85d140852b8d9928565f0f6b2d98dc088/donut/model.py#L602
 
-from transformers import DonutProcessor, FlaxVisionEncoderDecoderModel, BartConfig
+from transformers import (BartConfig, DonutProcessor,
+                          FlaxVisionEncoderDecoderModel)
 
 processor = DonutProcessor.from_pretrained("nielsr/donut-base")
 model = FlaxVisionEncoderDecoderModel.from_pretrained("nielsr/donut-base", config=config, from_pt=True)
@@ -102,6 +92,9 @@ model.params['decoder']['model']['decoder']['embed_tokens']['embedding'] = jnp.c
     [model.params['decoder']['model']['decoder']['embed_tokens']['embedding'], extra_tokens], axis=0)
 
 assert model.params['decoder']['model']['decoder']['embed_tokens']['embedding'].shape[0] == len(processor.tokenizer)
+
+model.config.pad_token_id = processor.tokenizer.pad_token_id
+model.config.decoder_start_token_id = processor.tokenizer.convert_tokens_to_ids(['<s_rvlcdip>'])[0]
 
 len(processor.tokenizer)
 
@@ -254,76 +247,6 @@ class DonutDataset(Dataset):
         return encoding
 
 
-train_dataset = DonutDataset("nielsr/rvl_cdip_10_examples_per_class_donut", max_length=max_length,
-                             split="train", task_start_token="<s_rvlcdip>", prompt_end_token="<s_rvlcdip>",
-                             sort_json_key=False,  # rvlcdip dataset is preprocessed, so no need for this
-                             )
-
-# I'm using a small batch size to make sure it fits in the memory Colab provides
-train_batch_size = 8
-train_dataloader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True)
-
-
-validation_dataset = DonutDataset("nielsr/rvl_cdip_10_examples_per_class_donut", max_length=max_length,
-                                  split="test", task_start_token="<s_rvlcdip>", prompt_end_token="<s_rvlcdip>",
-                                  sort_json_key=False,  # rvlcdip dataset is preprocessed, so no need for this
-                                  )
-
-# I'm using a small batch size to make sure it fits in the memory Colab provides
-validation_dataloader = DataLoader(validation_dataset, batch_size=1, shuffle=True)
-
-
-batch = next(iter(train_dataloader))
-print(batch.keys())
-
-for id in batch['labels'][0].tolist():
-    if id != -100:
-        print(processor.decode([id]))
-    else:
-        print(id)
-
-from PIL import Image
-import numpy as np
-
-mean = (0.485, 0.456, 0.406)
-std = (0.229, 0.224, 0.225)
-
-# unnormalize
-reconstructed_image = (batch['pixel_values'][0] * torch.tensor(std)[:, None, None]) + torch.tensor(mean)[:, None, None]
-# unrescale
-reconstructed_image = reconstructed_image * 255
-# convert to numpy of shape HWC
-reconstructed_image = torch.moveaxis(reconstructed_image, 0, -1)
-image = Image.fromarray(reconstructed_image.numpy().astype(np.uint8))
-image
-
-"""## Train model
-
-Ok there's one additional thing before we can start training the model: during training, the model can create the `decoder_input_ids` (the decoder inputs) automatically based on the `labels` (by simply shifting them one position to the right, prepending the `decoder_start_token_id` and replacing labels which are -100 by the `pad_token_id`). Therefore, we need to set those variables, to make sure the `decoder_input_ids` are created automatically.
-
-This ensures we only need to prepare labels for the model. Theoretically you can also create the `decoder_input_ids` yourself and not set the 2 variables below. This is what the original authors of Donut did.
-"""
-
-import optax
-from flax.training.train_state import TrainState
-
-model.config.pad_token_id = processor.tokenizer.pad_token_id
-model.config.decoder_start_token_id = processor.tokenizer.convert_tokens_to_ids(['<s_rvlcdip>'])[0]
-
-# sanity check
-print("Pad token ID:", processor.decode([model.config.pad_token_id]))
-print("Decoder start token ID:", processor.decode([model.config.decoder_start_token_id]))
-
-seed = jax.random.PRNGKey(seed=1729)
-
-input_shape = (
-    (1, height, width, num_channels),
-    (1, 1),
-)
-model.config.decoder.vocab_size = 57545
-model.params = model.init_weights(seed, input_shape, model.params)
-
-
 def shift_tokens_right(input_ids: np.ndarray, pad_token_id: int, decoder_start_token_id: int):
     """
     Shift input ids one token to the right.
@@ -339,37 +262,118 @@ def shift_tokens_right(input_ids: np.ndarray, pad_token_id: int, decoder_start_t
     # replace possible -100 values in labels by `pad_token_id`
     shifted_input_ids = np.where(shifted_input_ids == -100, pad_token_id, shifted_input_ids)
 
-    return jnp.asarray(shifted_input_ids, dtype=jnp.int32)
+    return np.asarray(shifted_input_ids, dtype=np.int32)
+
+
+def collate_donut_dataset(item_ls: List[Dict[str, np.ndarray]], device_count: int,
+                          pad_token_id: int, decoder_start_token_id: int, for_pmap: bool = True) -> Tuple[np.ndarray, np.ndarray,
+                                                                                                          np.ndarray, np.ndarray]:
+    images = []
+    labels = []
+    for item in item_ls:
+        images.append(item['pixel_values'].numpy())
+        labels.append(item['labels'].numpy())
+    images = np.stack(images)
+    labels = np.stack(labels)
+    # images, labels = jnp.asarray(batch["pixel_values"].numpy()), batch["labels"].numpy()
+    images = images.transpose(0, 2, 3, 1)
+    decoder_input_ids = shift_tokens_right(labels, pad_token_id, decoder_start_token_id)
+    labels = np.asarray(labels)
+    position_ids = np.broadcast_to(np.arange(0, labels.shape[1]), labels.shape)
+
+    if for_pmap:
+        images = np.reshape(images, (device_count, -1, *images.shape[1:]))
+        decoder_input_ids = np.reshape(decoder_input_ids, (device_count, -1, *decoder_input_ids.shape[1:]))
+        labels = np.reshape(labels, (device_count, -1, *labels.shape[1:]))
+        position_ids = np.reshape(position_ids, (device_count, -1, *position_ids.shape[1:]))
+
+    return images, labels, decoder_input_ids, position_ids
+
+
+train_dataset = DonutDataset("nielsr/rvl_cdip_10_examples_per_class_donut", max_length=max_length,
+                             split="train", task_start_token="<s_rvlcdip>", prompt_end_token="<s_rvlcdip>",
+                             sort_json_key=False,  # rvlcdip dataset is preprocessed, so no need for this
+                             )
+
+# I'm using a small batch size to make sure it fits in the memory Colab provides
+train_batch_size = jax.local_device_count() * 4
+collate_fn = partial(collate_donut_dataset, device_count=jax.local_device_count(),
+                     pad_token_id=model.config.pad_token_id, decoder_start_token_id=model.config.decoder_start_token_id)
+train_dataloader = DataLoader(train_dataset, batch_size=train_batch_size,
+                              shuffle=True, drop_last=True, collate_fn=collate_fn, prefetch_factor=2, num_workers=2)
+
+
+validation_dataset = DonutDataset("nielsr/rvl_cdip_10_examples_per_class_donut", max_length=max_length,
+                                  split="test", task_start_token="<s_rvlcdip>", prompt_end_token="<s_rvlcdip>",
+                                  sort_json_key=False,  # rvlcdip dataset is preprocessed, so no need for this
+                                  )
+# I'm using a small batch size to make sure it fits in the memory Colab provides
+validation_batch_size = 8
+val_collate_fn = partial(collate_donut_dataset, device_count=jax.local_device_count(),
+                         pad_token_id=model.config.pad_token_id,
+                         decoder_start_token_id=model.config.decoder_start_token_id, for_pmap=False)
+validation_dataloader = DataLoader(validation_dataset, batch_size=validation_batch_size,
+                                   shuffle=True, drop_last=False, collate_fn=val_collate_fn, prefetch_factor=2,
+                                   num_workers=2)
+
+
+def sanity_check():
+    # batch = next(iter(train_dataloader))
+
+    # for id in batch['labels'][0].tolist():
+    #     if id != -100:
+    #         print(processor.decode([id]))
+    #     else:
+    #         print(id)
+
+    # mean = (0.485, 0.456, 0.406)
+    # std = (0.229, 0.224, 0.225)
+
+    # # unnormalize
+    # reconstructed_image = (batch['pixel_values'][0] * torch.tensor(std)[:, None, None]) + torch.tensor(mean)[:, None, None]
+    # # unrescale
+    # reconstructed_image = reconstructed_image * 255
+    # # convert to numpy of shape HWC
+    # reconstructed_image = torch.moveaxis(reconstructed_image, 0, -1)
+    # image = Image.fromarray(reconstructed_image.numpy().astype(np.uint8))
+    pass
+
+
+# sanity check
+print("Pad token ID:", processor.decode([model.config.pad_token_id]))
+print("Decoder start token ID:", processor.decode([model.config.decoder_start_token_id]))
+
+seed = jax.random.PRNGKey(seed=1729)
+
+input_shape = (
+    (1, height, width, num_channels),
+    (1, 1),
+)
+model.config.decoder.vocab_size = 57545
+model.params = model.init_weights(seed, input_shape, model.params)
 
 
 def train_step(state: TrainState, batch):
-    device_count = jax.local_device_count()
+    images, labels, decoder_input_ids, position_ids = batch
+    images, labels, decoder_input_ids, position_ids = jnp.array(images), jnp.array(
+        labels), jnp.array(decoder_input_ids), jnp.array(position_ids)
 
-    images, labels = jnp.asarray(batch["pixel_values"].numpy()), batch["labels"].numpy()
-    images = images.transpose(0, 2, 3, 1)
-    decoder_input_ids = shift_tokens_right(labels, model.config.pad_token_id, model.config.decoder_start_token_id)
-    labels = jnp.asarray(labels)
-    position_ids = jnp.broadcast_to(jnp.arange(0, labels.shape[1]), labels.shape)
-    images = jnp.reshape(images, (device_count, -1, *images.shape[1:]))
-    decoder_input_ids = jnp.reshape(decoder_input_ids, (device_count, -1, *decoder_input_ids.shape[1:]))
-    labels = jnp.reshape(labels, (device_count, -1, *labels.shape[1:]))
-    position_ids = jnp.reshape(position_ids, (device_count, -1, *position_ids.shape[1:]))
-
-    def loss_fn(
-            state: TrainState, images: jnp.ndarray, decoder_input_ids: jnp.ndarray, position_ids: jnp.ndarray,
-            labels: jnp.ndarray):
-        lm_outputs = state.apply_fn({'params': state.params}, images, decoder_input_ids, None, position_ids)
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits=lm_outputs.logits, labels=labels).mean()
+    def loss_fn(params: dict, state: TrainState, images: jnp.ndarray, decoder_input_ids: jnp.ndarray,
+                position_ids: jnp.ndarray, labels: jnp.ndarray):
+        lm_outputs = state.apply_fn({'params': params}, images, decoder_input_ids, None, position_ids)
+        loss = optax.softmax_cross_entropy_with_integer_labels(
+            logits=lm_outputs.logits[:, :4], labels=labels[:, :4]).mean()
         return loss, lm_outputs.logits
 
-    # hack #2 I am using allow_int to handle this model param, which is not be finetuned
-    # https://github.com/amankhandelia/transformers/blob/feature/donut_flax_implementation/src/transformers/models/donut/modeling_flax_donut_swin.py#L411
+    # TODO: investigate why is allow_int necessary
     gradient_fn = jax.value_and_grad(loss_fn, has_aux=True, allow_int=True)
 
     # Use pmap to parallelize the computation
-    pmap_fn = jax.pmap(gradient_fn, in_axes=(None, 0, 0, 0, 0))
-    (loss, logits), grads = pmap_fn(state, images, decoder_input_ids, position_ids, labels)
+    pmap_fn = jax.pmap(gradient_fn, in_axes=(None, None, 0, 0, 0, 0), axis_name='batch')
+    (loss, logits), grads = pmap_fn(state.params, state, images, decoder_input_ids, position_ids, labels)
+    grads = jax.tree_map(lambda x: jnp.mean(x, axis=0), grads)
     state = state.apply_gradients(grads=grads)
+
     return loss, state
 
 
@@ -390,30 +394,87 @@ def get_args_for_models(batch: dict, model: FlaxVisionEncoderDecoderModel):
     return images, labels, decoder_input_ids, position_ids
 
 
-def get_accuracy_score(model: FlaxVisionEncoderDecoderModel, state: TrainState, val_dataloader: DataLoader) -> int:
+def get_accuracy_score(
+        model: FlaxVisionEncoderDecoderModel, state: TrainState, val_dataloader: DataLoader, verbose: bool = False) -> int:
     results = []
 
     for i, batch in enumerate(tqdm(val_dataloader)):
+
         # get args for model
-        images, labels, decoder_input_ids, position_ids = get_args_for_models(batch, model)
+        images, labels, decoder_input_ids, position_ids = batch
+        images, labels, decoder_input_ids, position_ids = jnp.array(images), jnp.array(
+            labels), jnp.array(decoder_input_ids), jnp.array(position_ids)
 
         # classify doc
         lm_outputs = model.module.apply({'params': state.params}, images, decoder_input_ids, None, position_ids)
         y_hat = jnp.argmax(lm_outputs.logits, axis=-1)
 
+        if verbose:
+            print(labels, y_hat)
+
         # ignore pad tokens and evaluate all others
-        result = jnp.all(jnp.select(labels != -100, y_hat == labels, True), axis=-1)
+        result = jnp.all(jnp.where(labels != -100, y_hat == labels, True), axis=-1)
         results.append(jnp.ravel(result))
 
     return jnp.stack(results).sum() / len(val_dataloader.dataset)
 
 
-from tqdm.auto import tqdm
-for epoch in range(10):
+def get_accuracy_score_generate(
+        model: FlaxVisionEncoderDecoderModel, state: TrainState, val_dataset: DonutDataset, verbose: bool = False) -> int:
+    import re
+    task_prompt = "<s_rvlcdip>"
+    output_list = []
+    accs = []
+    for idx, sample in tqdm(enumerate(val_dataset.dataset), total=len(val_dataset)):
+        # prepare encoder inputs
+        pixel_values = processor(sample["image"].convert("RGB"), return_tensors="np").pixel_values
+        pixel_values = pixel_values
+        # prepare decoder inputs
+
+        decoder_input_ids = processor.tokenizer(task_prompt, add_special_tokens=False, return_tensors="np").input_ids
+
+        # autoregressively generate sequence
+        outputs = model.generate(
+            pixel_values,
+            max_length=8,
+            early_stopping=True,
+            pad_token_id=processor.tokenizer.pad_token_id,
+            eos_token_id=processor.tokenizer.eos_token_id,
+            num_beams=1,
+            decoder_start_token_id=decoder_input_ids,
+        )
+
+        # turn into JSON
+        seq = processor.batch_decode(outputs.sequences)[0]
+        seq = seq.replace(processor.tokenizer.eos_token, "").replace(processor.tokenizer.pad_token, "")
+        seq = re.sub(r"<.*?>", "", seq, count=1).strip()  # remove first task start token
+        seq = processor.token2json(seq)
+
+        ground_truth = json.loads(sample["ground_truth"])
+        gt = ground_truth["gt_parse"]
+        score = float(seq["class"] == gt["class"]) if 'class' in seq else 0.
+
+        accs.append(score)
+
+        output_list.append(seq)
+
+    scores = {"accuracies": accs, "mean_accuracy": np.mean(accs)}
+    print(scores, f"length : {len(accs)}")
+
+    return
+
+
+verbose = False
+for epoch in range(30):
     print("Epoch:", epoch + 1)
+    losses = []
     for i, batch in enumerate(tqdm(train_dataloader)):
         loss, state = train_step(state, batch)
-    print(f"Loss: {loss}")
-
-    score = get_accuracy_score(model, state, validation_dataloader)
+        losses.append(jnp.mean(loss))
+    print(f"Loss: {jnp.mean(jnp.stack(losses))}")
+    if epoch >= 15:
+        verbose = False
+    model.params = state.params
+    # score = get_accuracy_score(model, state, validation_dataloader, verbose=verbose)
+    score = get_accuracy_score_generate(model, state, validation_dataset, verbose=verbose)
     print(f"Accuracy: {score}")
